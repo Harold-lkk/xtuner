@@ -98,6 +98,9 @@ class SessionServer:
         """Hook for processing/modifying the request before forwarding."""
 
         session_id = req_body["session_id"]
+        return_token_ids = req_body.get("return_token_ids", True)
+        return_routed_experts = req_body.get("return_routed_experts", True)
+        logprobs = req_body.get("logprobs", True)
         # 1. chat_template render 出完整 prompt string，不 tokenize 全量
         prompt_text = self.tokenizer.apply_chat_template(
             canonicalize_messages_for_chat_template(req_body["messages"]),
@@ -121,9 +124,9 @@ class SessionServer:
             **{k: v for k, v in req_body.items() if k not in ["session_id", "messages"]},
             "messages": [],
             "input_ids": input_ids,
-            "return_token_ids": True,
-            "return_routed_experts": True,
-            "logprobs": True,
+            "return_token_ids": return_token_ids,
+            "return_routed_experts": return_routed_experts,
+            "logprobs": logprobs,
             "include_stop_str_in_output": True,
         }
         return worker_req

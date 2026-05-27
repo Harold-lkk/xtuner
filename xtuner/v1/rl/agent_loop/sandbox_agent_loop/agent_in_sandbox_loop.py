@@ -6,10 +6,9 @@ import importlib
 import json
 import traceback
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from lagent.utils import create_object
-
 from xtuner.v1.data_proto.rl_data import RolloutState, Status
 from xtuner.v1.rl.judger import Judger
 from xtuner.v1.rl.rollout import RolloutController
@@ -44,7 +43,6 @@ def _resolve_runner(pipeline: Any, session_id: str) -> Any:
         return create_object(runner_cfg)
     return pipeline
 
-
 class AgentInSandboxLoopConfig(AgentLoopConfig):
     """Run a sandbox agent runner from ``RolloutState.extra_fields``.
 
@@ -56,6 +54,7 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
     """
 
     max_concurrent_samples: int | None = None
+    mode: Literal["train", "eval"] = "train"
 
     def build_local(
         self, rollout_controller: RolloutController | None = None, judger: Judger | None = None, logger=None
@@ -66,6 +65,7 @@ class AgentInSandboxLoopConfig(AgentLoopConfig):
             judger=judger,
             logger=logger,
             max_concurrent_samples=self.max_concurrent_samples,
+            mode=self.mode,
         )
 
 
@@ -77,9 +77,11 @@ class AgentInSandboxLoop(AgentLoop):
         judger: Judger | None = None,
         logger=None,
         max_concurrent_samples: int | None = None,
+        mode: Literal["train", "eval"] = "train",
     ):
         super().__init__(rollout_ctl, None, hf_checkpoint, judger, logger)
         self.max_concurrent_samples = max_concurrent_samples
+        self.mode = mode
         self._sample_semaphore = asyncio.Semaphore(max_concurrent_samples) if max_concurrent_samples else None
 
     async def generate_group(self, rollout_state: list[RolloutState], **kwargs) -> list[RolloutState]:
@@ -109,6 +111,20 @@ class AgentInSandboxLoop(AgentLoop):
             await self._fill_rollout_state(rollout_state, result)
             return rollout_state
         except Exception as exc:
+            if self.mode == "eval":
+                # 评估模式下即使出错也视为完成，错误信息记录在 rollout_state.error_msg 中
+                rollout_state.reward = {"score": 0.0}
+                rollout_state.response = None
+                rollout_state.response_ids = None
+                rollout_state.logprobs = None
+                rollout_state.routed_experts = None
+                rollout_state.input_ids = None
+                rollout_state.labels = None
+                rollout_state.finish_reason = "error"
+                rollout_state.status = Status.COMPLETED
+                rollout_state.error_msg = f"{type(exc).__name__}: {exc}"
+                self.logger.error(f"[AgentInSandboxLoop] error in eval mode: {exc}\n{traceback.format_exc()}")
+                return rollout_state
             rollout_state.status = Status.FAILED
             rollout_state.finish_reason = "error"
             rollout_state.error_msg = f"{type(exc).__name__}: {exc}"
@@ -140,6 +156,23 @@ class AgentInSandboxLoop(AgentLoop):
         messages = segment["messages"]
         if not isinstance(messages, list):
             raise TypeError("Agent messages trace segment.messages must be a list.")
+        if self.mode == "eval":
+            rollout_state.response = artifacts["agent_response"]
+            rollout_state.response_ids = None
+            rollout_state.logprobs = None
+            rollout_state.routed_experts = None
+            rollout_state.input_ids = None
+            rollout_state.labels = None
+            if item.status == RolloutStatus.COMPLETED:
+                rollout_state.reward = {"score": item.reward if item.reward is not None else 0.0}
+                rollout_state.finish_reason = "stop"
+            else:
+                rollout_state.reward = {"score": 0.0}
+                rollout_state.finish_reason = "error"
+            # 评估中失败的样本也视为完成
+            rollout_state.status = Status.COMPLETED
+            return rollout_state
+
         session_id = rollout_state.uid
 
         trace_store = get_store()

@@ -636,10 +636,11 @@ class BaseRLTrainer:
 
         if self._enable_evaluate:
             assert cfg.eval_agent_loop_manager_cfg is not None
+            self._eval_replay_buffer = SyncReplayBufferConfig().build()
             self.eval_agent_loop_manager = cfg.eval_agent_loop_manager_cfg.build(
                 rollout_controller=self.rollout_controller,
                 tokenizer=self.tokenizer,
-                replay_buffer=replay_buffer,
+                replay_buffer=self._eval_replay_buffer,
                 logger=self.logger,
                 sync_weights_interval=cfg.sync_weights_interval,
             )
@@ -854,7 +855,7 @@ class BaseRLTrainer:
         eval_trajectory_dir = self.exp_dir / "eval_rollout"
         eval_trajectory_dir.mkdir(parents=True, exist_ok=True)
         eval_trajectory_path = eval_trajectory_dir / f"eval_rollout_{train_step}.jsonl"
-        self._save_trajectories(eval_batch, eval_trajectory_path)
+        self._save_eval_trajectories(eval_batch, eval_trajectory_path)
         self.logger.info(f"Train step {train_step} eval trajectories saved to {eval_trajectory_path}")
         return eval_metrics
 
@@ -1269,6 +1270,55 @@ class BaseRLTrainer:
                         "label": ground_truth,
                         "reward": data.reward["score"],
                         "finish_reason": data.finish_reason,
+                    }
+                )
+
+        rewards_tensor = torch.tensor(rewards).float() if rewards else torch.tensor([0.0]).float()
+        response_len_list = [item["response_len"] for item in trajectory_items]
+        response_lens = torch.tensor(response_len_list).float() if response_len_list else torch.tensor([0.0]).float()
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            summary = {
+                "reward_mean": rewards_tensor.mean().item(),
+                "reward_std": rewards_tensor.std().item(),
+                "reward_max": rewards_tensor.max().item(),
+                "reward_min": rewards_tensor.min().item(),
+                "response_len_mean": response_lens.mean().item(),
+                "response_len_std": response_lens.std().item(),
+                "response_len_max": response_lens.max().item(),
+                "response_len_min": response_lens.min().item(),
+                "total_len": len(rewards),
+            }
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            for item in trajectory_items:
+                json.dump(item, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+    def _save_eval_trajectories(self, data_groups: list[list[RolloutState]], save_path: Path) -> None:
+        rewards = []
+        trajectory_items = []
+
+        for group in data_groups:
+            for data in group:
+                assert data.reward is not None
+                reward = data.reward["score"]
+                response = data.response or ""
+                response_len = len(self.tokenizer.encode(response, add_special_tokens=False))
+                rewards.append(reward)
+                ground_truth = None
+                if data.reward_model is not None:
+                    ground_truth = data.reward_model.get("ground_truth")
+                trajectory_items.append(
+                    {
+                        "prompt": data.message,
+                        "raw_prompt": data.extra_fields.get("raw_prompt", None),
+                        "response": response,
+                        "response_len": response_len,
+                        "label": ground_truth,
+                        "reward": reward,
+                        "finish_reason": data.finish_reason,
+                        "error_msg": data.error_msg,
                     }
                 )
 
