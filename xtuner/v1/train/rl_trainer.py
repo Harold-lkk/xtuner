@@ -361,6 +361,7 @@ class BaseRLTrainerConfig(BaseModel):
     debug_rollout: bool = False
     debug_rollout_dir: Path | str | None = None
     debug_train: bool = False
+    debug_swap: bool = False
     skip_checkpoint_validation: bool = False
     exp_tracker: Literal["tensorboard", "jsonl"] = "tensorboard"
     trace_config: TraceConfig = Field(default_factory=TraceConfig)
@@ -369,6 +370,11 @@ class BaseRLTrainerConfig(BaseModel):
     def _validate_sync_intervals(self):
         if self.debug_rollout and self.debug_train:
             raise ValueError("debug_rollout and debug_train cannot be enabled at the same time.")
+        if self.debug_swap and not self.debug_rollout:
+            # debug_swap validates the keep-alive weight swap without a fit step; it relies on
+            # debug_rollout to skip fit (the only OOM source) while still running the real
+            # offload/onload/update_weights dance.
+            raise ValueError("debug_swap requires debug_rollout=True.")
         if self.debug_rollout and self.debug_rollout_dir is None:
             raise ValueError("debug_rollout_dir must be provided when debug_rollout=True.")
         if self.debug_train and self.debug_rollout_dir is None:
@@ -698,6 +704,7 @@ class BaseRLTrainer:
         self._debug_rollout = cfg.debug_rollout
         self._debug_rollout_dir = Path(cfg.debug_rollout_dir) if cfg.debug_rollout_dir is not None else None
         self._debug_train = cfg.debug_train
+        self._debug_swap = cfg.debug_swap
         self._debug_train_files: dict[int, Path] = {}
 
     def _build_agent_loop_components(self, cfg: BaseRLTrainerConfig, replay_buffer) -> None:
@@ -1575,7 +1582,7 @@ class RLColocateTrainer(BaseRLTrainer):
         self._cpu_resource_manager.log_initial_snapshot()
         set_cpu_resource_manager(self._cpu_resource_manager)
 
-        if self._debug_rollout:
+        if self._debug_rollout and not self._debug_swap:
             if self._rollout_config.skip_load_weights:
                 self.logger.info(
                     "debug_rollout cannot be used with rollout_config.skip_load_weights=True. force set skip_load_weights to False"
@@ -1590,6 +1597,8 @@ class RLColocateTrainer(BaseRLTrainer):
 
             return
 
+        # debug_swap falls through to the full colocate setup below: it needs train_controller +
+        # rollout_controller + bind so the real weight swap can run; _fit then skips only fit.
         self.train_controller = self._train_worker_cfg.build(self._pg)
 
         checkpoint_path = self._load_checkpoint_cfg.checkpoint_path
@@ -1715,6 +1724,24 @@ class RLColocateTrainer(BaseRLTrainer):
                     if weights_synced and self._enable_evaluate and train_step % self._evaluate_step == 0:
                         with timer("evaluation", step_timer_dict):
                             eval_log_info.update(asyncio_run(self._run_evaluation(train_step)))
+                elif self._debug_swap:
+                    # Run the real weight-swap dance minus fit, so the keep-alive gate is
+                    # exercised across a genuine offload/onload/update_weights/kvcache swap
+                    # without the fit-only OOM. Mirror _train_one_batch's resource boundary
+                    # (offload rollout, onload train) before the swap, then swap; the only
+                    # difference from real training is that no gradient step ran.
+                    ray.get(
+                        self.rollout_controller.check_and_shutdown_inactive_workers.remote(),
+                        timeout=RL_TRAINER_RAY_GET_TIMEOUT,
+                    )
+                    ray.get(self.rollout_controller.offload.remote(), timeout=RL_TRAINER_RAY_GET_TIMEOUT)
+                    with timer("onload", step_timer_dict):
+                        self.train_controller.onload(target="all")
+                        self.logger.info("Training controller loaded (debug_swap: no fit)")
+                    weights_synced = self._sync_weights_and_save(train_step, step_timer_dict)
+                    if weights_synced:
+                        model_step = train_step
+                    eval_log_info = {}
                 else:
                     eval_log_info = {}
 

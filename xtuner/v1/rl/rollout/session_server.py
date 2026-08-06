@@ -1,5 +1,8 @@
+import asyncio
+import contextlib
 import copy
 import json
+import time
 from functools import reduce
 from http import HTTPStatus
 from operator import add
@@ -249,6 +252,8 @@ class SessionServer:
         port (int): Port for this session server to listen on.
         request_timeout (float): Total timeout in seconds for forwarding requests to the worker.
         read_bufsize (int): Buffer limit for line reader in ClientSession. Default is 64MB (2**26).
+        keepalive_interval (float): Seconds between SSE heartbeat comments emitted to a streaming
+            client whose turn is held at the keep-alive gate during a weight swap.
     """
 
     def __init__(
@@ -260,6 +265,7 @@ class SessionServer:
         request_timeout: float = 1200.0,
         read_bufsize: int = 2**26,
         enable_return_routed_experts: bool = False,
+        keepalive_interval: float = 15.0,
     ):
         self.worker_base_url = worker_base_url.rstrip("/")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -268,6 +274,7 @@ class SessionServer:
         self.request_timeout = request_timeout
         self.read_bufsize = read_bufsize
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.keepalive_interval = keepalive_interval
         self.store = get_store()
         self.stop_word = self.tokenizer.eos_token or ""
 
@@ -275,6 +282,16 @@ class SessionServer:
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._lmdeploy_actor: Optional[ray.actor.ActorHandle] = None
+
+        # Keep-alive gate. ``_gate_open`` is set (open) in steady state; a weight
+        # swap clears it so no NEW upstream turn is forwarded. ``_inflight`` counts
+        # turns already forwarded upstream; ``_idle`` is set whenever that count is
+        # zero, so ``wait_quiescent`` can block until the engine is safe to offload.
+        self._gate_open = asyncio.Event()
+        self._gate_open.set()
+        self._inflight = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
 
     async def on_request(self, req_body: dict, fmt: str, *, trace_enabled: bool = True) -> dict:
         """Normalize the request to drive the prefix cache + inject extension
@@ -529,6 +546,111 @@ class SessionServer:
         self._app = None
         get_logger().info("SessionServer stopped.")
 
+    def pause(self) -> None:
+        """Close the keep-alive gate.
+
+        No NEW upstream turn is forwarded after this returns; turns already in
+        flight finish naturally. Call ``wait_quiescent`` afterwards to block
+        until the engine is safe to offload.
+        """
+        self._gate_open.clear()
+
+    def resume(self) -> None:
+        """Open the keep-alive gate so held turns forward upstream (with post-
+        swap weights)."""
+        self._gate_open.set()
+
+    async def wait_quiescent(self, timeout: float) -> bool:
+        """Block until no upstream turn is in flight, or ``timeout`` elapses.
+
+        Args:
+            timeout (float): Max seconds to wait for the in-flight turn count to
+                reach zero.
+
+        Returns:
+            bool: True if quiescent (safe to offload); False on timeout (a turn
+            is stuck upstream — caller should log and proceed rather than abort).
+        """
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            get_logger().warning(
+                f"SessionServer.wait_quiescent timed out after {timeout}s with {self._inflight} in-flight turn(s)."
+            )
+            return False
+
+    @contextlib.asynccontextmanager
+    async def _track_inflight(self):
+        """Count one upstream turn as in-flight for the duration of the block.
+
+        The event loop is single-threaded, so the increment lands before any
+        await inside the block yields — a turn is therefore either counted here
+        (``wait_quiescent`` waits for it) or still blocked at the gate (excluded).
+        """
+        self._inflight += 1
+        self._idle.clear()
+        try:
+            yield
+        finally:
+            self._inflight -= 1
+            if self._inflight <= 0:
+                self._inflight = 0
+                self._idle.set()
+
+    async def _wait_for_gate(
+        self, request: web.Request, is_stream: bool, session_id: Any = None
+    ) -> Optional[web.StreamResponse]:
+        """Hold a turn at the gate until ``resume()``.
+
+        For streaming requests, prepare an SSE response up front and emit
+        heartbeat comment lines every ``keepalive_interval`` seconds so the
+        client socket stays warm; the prepared response is returned so the
+        caller reuses it for the real stream. Non-streaming requests simply
+        block (no heartbeat channel exists) and return None.
+
+        Args:
+            request (web.Request): The inbound turn held before forwarding.
+            is_stream (bool): Whether the client asked for a streamed response.
+            session_id (Any): Client session id, logged so a held turn can be
+                traced across the swap.
+        """
+        start = time.monotonic()
+        get_logger().info(f"[keep-alive] hold turn at closed gate (session={session_id}, stream={is_stream})")
+        if not is_stream:
+            await self._gate_open.wait()
+            get_logger().info(
+                f"[keep-alive] release turn after {time.monotonic() - start:.1f}s, no heartbeat "
+                f"(non-stream, session={session_id})"
+            )
+            return None
+
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        beats = 0
+        while not self._gate_open.is_set():
+            try:
+                # SSE comment line — ignored by the client's event parser, so it
+                # never reaches the trace or a data event, but keeps the socket live.
+                await response.write(b": keep-alive\n\n")
+                beats += 1
+            except (ConnectionError, ClientConnectionResetError):
+                get_logger().warning(
+                    f"[keep-alive] client gone while held after {time.monotonic() - start:.1f}s, "
+                    f"{beats} heartbeat(s) (session={session_id})"
+                )
+                break  # client gone; the forward+pipe path will observe it too
+            try:
+                await asyncio.wait_for(self._gate_open.wait(), timeout=self.keepalive_interval)
+            except asyncio.TimeoutError:
+                continue
+        else:
+            get_logger().info(
+                f"[keep-alive] release turn after {time.monotonic() - start:.1f}s, "
+                f"{beats} heartbeat(s) sent (session={session_id})"
+            )
+        return response
+
     async def _handle_request(self, request: web.Request) -> web.Response:
         """Proxy handler: detect format, run hooks, forward, stream back."""
 
@@ -615,21 +737,39 @@ class SessionServer:
         )
 
         timeout = ClientTimeout(total=self.request_timeout, sock_connect=30)
-        async with ClientSession(read_bufsize=self.read_bufsize, timeout=timeout) as client:
+
+        # Keep-alive gate: while paused for a weight swap, hold this turn HERE —
+        # before it is forwarded upstream — so already-forwarded turns can drain
+        # and the engine can quiesce. Streaming requests receive SSE heartbeat
+        # comments meanwhile so the client socket does not idle-timeout across
+        # the swap; on resume the turn forwards with the post-swap weights.
+        pre_prepared_stream: Optional[web.StreamResponse] = None
+        if not self._gate_open.is_set():
+            # Read from orig_req_body: on_request strips session_id (a
+            # SessionServer-only key) from request_data before forwarding.
+            session_id = orig_req_body.get("session_id") if orig_req_body else None
+            pre_prepared_stream = await self._wait_for_gate(request, is_stream, session_id)
+
+        async with self._track_inflight(), ClientSession(read_bufsize=self.read_bufsize, timeout=timeout) as client:
             async with client.request(
                 method=request.method, url=target_url, headers=forward_headers, data=request_body
             ) as resp:
                 if is_stream:
                     response_chunks: list[bytes] = []
-                    response = web.StreamResponse(
-                        status=resp.status,
-                        headers={
-                            k: v
-                            for k, v in resp.headers.items()
-                            if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
-                        },
-                    )
-                    await response.prepare(request)
+                    if pre_prepared_stream is not None:
+                        # Heartbeat already flushed SSE headers while gated; keep
+                        # writing into the same prepared response.
+                        response = pre_prepared_stream
+                    else:
+                        response = web.StreamResponse(
+                            status=resp.status,
+                            headers={
+                                k: v
+                                for k, v in resp.headers.items()
+                                if k.lower() not in ("transfer-encoding", "content-length", "content-encoding")
+                            },
+                        )
+                        await response.prepare(request)
                     # If the downstream client closes the socket mid-stream
                     # (e.g. AsyncAPIClient bails out on a finish_reason=='error'
                     # chunk after the prompt overflowed the session window),
@@ -1044,6 +1184,7 @@ class SessionServerActor:
         port: int,
         request_timeout: float,
         enable_return_routed_experts: bool = False,
+        keepalive_interval: float = 15.0,
     ):
         self.worker_base_url = worker_base_url
         self.tokenizer_path = tokenizer_path
@@ -1051,6 +1192,7 @@ class SessionServerActor:
         self.port = port
         self.request_timeout = request_timeout
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.keepalive_interval = keepalive_interval
         self.server: SessionServer | None = None
 
     @property
@@ -1068,6 +1210,7 @@ class SessionServerActor:
             port=self.port,
             request_timeout=self.request_timeout,
             enable_return_routed_experts=self.enable_return_routed_experts,
+            keepalive_interval=self.keepalive_interval,
         )
         await self.server.start()
         return self.server.url
@@ -1076,3 +1219,20 @@ class SessionServerActor:
         if self.server is not None:
             await self.server.stop()
             self.server = None
+
+    def pause(self) -> None:
+        """Close the keep-alive gate on the wrapped SessionServer."""
+        if self.server is not None:
+            self.server.pause()
+
+    def resume(self) -> None:
+        """Open the keep-alive gate on the wrapped SessionServer."""
+        if self.server is not None:
+            self.server.resume()
+
+    async def wait_quiescent(self, timeout: float) -> bool:
+        """Block until the wrapped SessionServer has no upstream turn in
+        flight."""
+        if self.server is None:
+            return True
+        return await self.server.wait_quiescent(timeout)

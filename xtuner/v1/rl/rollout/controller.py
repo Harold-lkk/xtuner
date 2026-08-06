@@ -165,6 +165,41 @@ class RolloutController:
         self._broadcast_to_active_workers("continue_generation")
         self.health_manager.resume()
 
+    def drain_generation(self, timeout: float):
+        """Soft-stop for a weight swap: close the SessionServer keep-alive gate on
+        every active worker and block until upstream turns have drained.
+
+        In-flight rollouts are held at the gate (kept warm by SSE heartbeat) rather
+        than aborted, so they survive the swap. Complements the hard
+        ``pause_generation`` above, which aborts.
+        """
+        self.health_manager.pause()
+        active_workers = self.registry.active_workers()
+        futures = [
+            worker.actor.drain_session_server.remote(timeout)  # type: ignore[attr-defined]
+            for worker in active_workers
+        ]
+        try:
+            results = ray.get(futures, timeout=max(ROLLOUT_RAY_GET_TIMEOUT, timeout + 60.0))
+        except Exception:
+            self.logger.exception(
+                f"RolloutController drain_generation failed for {len(active_workers)} active workers."
+            )
+            raise
+        not_quiescent = [worker.url for worker, result in zip(active_workers, results) if result is False]
+        self.logger.info(
+            f"Drain (soft-stop) gate closed: quiescent={len(active_workers) - len(not_quiescent)}/{len(active_workers)}"
+        )
+        if not_quiescent:
+            self.logger.warning(f"Drain did not reach quiescence before {timeout}s: worker_urls={not_quiescent}")
+
+    def resume_generation(self):
+        """Reopen the SessionServer keep-alive gate so held turns forward with
+        post-swap weights."""
+        self._broadcast_to_active_workers("resume_session_server")
+        self.health_manager.resume()
+        self.logger.info("Resume (open gate): held turns now forwarding with post-swap weights")
+
     def offload(self):
         self._broadcast_to_active_workers("offload")
 

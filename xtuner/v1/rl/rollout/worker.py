@@ -295,6 +295,14 @@ class RolloutConfig(BaseModel):
             help="Timeout duration (in seconds) for SessionServer requests forwarded to rollout workers.",
         ),
     ] = 1200.0
+    keepalive_interval: Annotated[
+        float,
+        Parameter(
+            group=infer_group,
+            help="Seconds between SSE heartbeat comments sent to a streaming client whose turn is held at "
+            "the SessionServer keep-alive gate during a weight swap.",
+        ),
+    ] = 15.0
     context_length: Annotated[
         Optional[int],
         Parameter(
@@ -707,6 +715,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                 port=self.session_server_port,
                 request_timeout=self.config.session_server_timeout,
                 enable_return_routed_experts=self.enable_return_routed_experts,
+                keepalive_interval=self.config.keepalive_interval,
             )
         )
         self.session_server_url = ray.get(
@@ -745,6 +754,37 @@ class RolloutWorker(SingleAcceleratorWorker):
     def continue_generation(self):
         """Resume the worker's generation process."""
         self.receive_abort_request.clear()
+
+    async def pause_session_server(self):
+        """Soft-stop: close the SessionServer keep-alive gate (no hard abort).
+
+        New upstream turns are held at the gate; in-flight turns finish. Used by
+        the weight-swap drain path so rollouts survive the swap instead of being
+        aborted. Complements the hard ``pause_generation`` above.
+        """
+        if self.session_server_actor is not None:
+            await self.session_server_actor.pause.remote()
+
+    async def resume_session_server(self):
+        """Open the SessionServer keep-alive gate so held turns forward with
+        new weights."""
+        if self.session_server_actor is not None:
+            await self.session_server_actor.resume.remote()
+
+    async def drain_session_server(self, timeout: float) -> bool:
+        """Close the gate, then block until upstream turns have drained
+        (quiescent).
+
+        Args:
+            timeout (float): Max seconds to wait for the in-flight turn count to reach zero.
+
+        Returns:
+            bool: True if quiescent, False on timeout (a turn is stuck upstream).
+        """
+        if self.session_server_actor is None:
+            return True
+        await self.session_server_actor.pause.remote()
+        return await self.session_server_actor.wait_quiescent.remote(timeout)
 
     def check_health(self) -> bool:
         """Check the health of the worker's server.
